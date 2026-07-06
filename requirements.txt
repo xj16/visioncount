@@ -1,0 +1,5 @@
+# Core runtime dependencies (100% free, no paid API or cloud required).
+opencv-python-headless>=4.10,<6
+numpy>=1.26,<3
+Flask>=3.0
+matplotlib>=3.8

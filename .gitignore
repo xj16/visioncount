@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+
+# Build / dist
+build/
+dist/
+bin/
+obj/
+target/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Vagrant
+.vagrant/
+
+# Logs & artifacts
+*.log
+*.mp4
+*.avi
+!tests/**/*.mp4
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
