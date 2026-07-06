@@ -8,13 +8,20 @@ import pytest
 
 @pytest.fixture()
 def client(monkeypatch):
-    # Do not autostart the worker thread during tests.
+    # Keep the OpenCV worker thread fully off during tests: no eager autostart
+    # and no lazy start on request. The endpoints still respond (with empty /
+    # placeholder data) without a running worker.
     monkeypatch.setenv("VISIONCOUNT_AUTOSTART", "0")
+    monkeypatch.setenv("VISIONCOUNT_LAZY_START", "0")
     from visioncount.app import VideoProcessor, create_app
 
-    app = create_app(VideoProcessor(source="synthetic"))
+    processor = VideoProcessor(source="synthetic")
+    app = create_app(processor)
     app.config.update(TESTING=True)
-    return app.test_client()
+    try:
+        yield app.test_client()
+    finally:
+        processor.stop()
 
 
 def test_app_imports():

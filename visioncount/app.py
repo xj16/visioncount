@@ -280,9 +280,24 @@ def create_app(processor: Optional[VideoProcessor] = None) -> Flask:
         processor = VideoProcessor(source=source)
 
     app.config["PROCESSOR"] = processor
-    # Start lazily so importing the module (e.g. in tests / CI) is cheap.
-    if os.environ.get("VISIONCOUNT_AUTOSTART", "1") == "1":
+
+    # Worker lifecycle. Importing the module must never spin up an OpenCV
+    # background thread (keeps tests / CI / `flask --app` cheap and avoids a
+    # daemon thread aborting during interpreter teardown on some platforms).
+    #   VISIONCOUNT_AUTOSTART=0 (default): do not start on import; start lazily
+    #                                      on the first HTTP request instead.
+    #   VISIONCOUNT_AUTOSTART=1:           start eagerly here.
+    # Tests set VISIONCOUNT_LAZY_START=0 to keep the worker fully off.
+    autostart = os.environ.get("VISIONCOUNT_AUTOSTART", "0") == "1"
+    lazy_start = os.environ.get("VISIONCOUNT_LAZY_START", "1") == "1"
+    if autostart:
         processor.start()
+
+    if lazy_start and not autostart:
+
+        @app.before_request
+        def _ensure_started():  # pragma: no cover - trivial guard
+            processor.start()  # idempotent; no-op once running
 
     @app.route("/")
     def index():
@@ -330,7 +345,12 @@ app = create_app()
 def main() -> None:  # pragma: no cover - manual run
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "5000"))
-    app.run(host=host, port=port, threaded=True)
+    processor: VideoProcessor = app.config["PROCESSOR"]
+    processor.start()
+    try:
+        app.run(host=host, port=port, threaded=True)
+    finally:
+        processor.stop()
 
 
 if __name__ == "__main__":  # pragma: no cover
