@@ -14,8 +14,10 @@ from __future__ import annotations
 
 from .detector import BackgroundSubtractorDetector, Detection
 from .tracker import CentroidTracker, Track
-from .counter import LineCounter, CountingLine
+from .counter import LineCounter, CountingLine, CrossEvent
 from .heatmap import Heatmap
+from .zone import Zone, ZoneCounter, point_in_polygon
+from .events import EventStore, StoredEvent
 from .pipeline import Pipeline, PipelineConfig, FrameResult
 
 __all__ = [
@@ -25,11 +27,17 @@ __all__ = [
     "Track",
     "LineCounter",
     "CountingLine",
+    "CrossEvent",
     "Heatmap",
+    "Zone",
+    "ZoneCounter",
+    "point_in_polygon",
+    "EventStore",
+    "StoredEvent",
     "Pipeline",
     "PipelineConfig",
     "FrameResult",
     "__version__",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

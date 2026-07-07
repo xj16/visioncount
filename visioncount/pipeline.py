@@ -10,7 +10,7 @@ a ``detect(frame) -> list[Detection]`` method works (including the optional
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Protocol
 
 import cv2
@@ -20,6 +20,7 @@ from .counter import CountingLine, CrossEvent, LineCounter
 from .detector import BackgroundSubtractorDetector, Detection
 from .heatmap import Heatmap
 from .tracker import CentroidTracker, Track
+from .zone import Zone, ZoneCounter
 
 
 class DetectorLike(Protocol):
@@ -48,6 +49,7 @@ class FrameResult:
     events: List[CrossEvent]
     totals: Dict[str, Dict[str, int]]
     frame_index: int
+    zones: Dict[str, Dict[str, object]] = field(default_factory=dict)
 
 
 # A small palette for drawing distinct track IDs.
@@ -72,6 +74,7 @@ class Pipeline:
         lines: Optional[List[CountingLine]] = None,
         detector: Optional[DetectorLike] = None,
         config: Optional[PipelineConfig] = None,
+        zones: Optional[List[Zone]] = None,
     ) -> None:
         self.width = int(width)
         self.height = int(height)
@@ -84,6 +87,7 @@ class Pipeline:
             max_distance=self.config.max_distance,
         )
         self.counter = LineCounter(lines or self._default_lines())
+        self.zone_counter = ZoneCounter(zones)
         self.heatmap = Heatmap(
             self.width,
             self.height,
@@ -109,6 +113,7 @@ class Pipeline:
         detections = self.detector.detect(frame)
         tracks = self.tracker.update(detections)
         events = self.counter.update(tracks)
+        self.zone_counter.update(tracks, self.frame_index)
         self.heatmap.update_from_tracks(tracks)
         return FrameResult(
             detections=detections,
@@ -116,6 +121,7 @@ class Pipeline:
             events=events,
             totals=self.counter.totals(),
             frame_index=self.frame_index,
+            zones=self.zone_counter.totals(),
         )
 
     # ---- drawing helpers -------------------------------------------------
@@ -123,6 +129,30 @@ class Pipeline:
     def annotate(self, frame: np.ndarray, result: FrameResult) -> np.ndarray:
         """Return a copy of ``frame`` with boxes, ids, lines and counts drawn."""
         out = frame.copy()
+
+        # Zones (translucent regions) drawn first so tracks/lines sit on top.
+        if self.zone_counter.zones:
+            overlay = out.copy()
+            for zone in self.zone_counter.zones:
+                if len(zone.polygon) < 3:
+                    continue
+                pts = np.array(zone.polygon, dtype=np.int32)
+                cv2.fillPoly(overlay, [pts], (140, 90, 30))
+                cv2.polylines(out, [pts], isClosed=True, color=(200, 140, 60),
+                              thickness=2)
+                cx = int(sum(p[0] for p in zone.polygon) / len(zone.polygon))
+                cy = int(sum(p[1] for p in zone.polygon) / len(zone.polygon))
+                cv2.putText(
+                    out,
+                    f"{zone.name}: {zone.occupancy}",
+                    (cx - 30, cy),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (240, 200, 120),
+                    2,
+                    cv2.LINE_AA,
+                )
+            cv2.addWeighted(overlay, 0.25, out, 0.75, 0, out)
 
         # Counting lines.
         for line in self.counter.lines:
@@ -165,6 +195,7 @@ class Pipeline:
     def reset(self) -> None:
         self.tracker.reset()
         self.counter.reset()
+        self.zone_counter.reset()
         self.heatmap.reset()
         self.frame_index = -1
         if hasattr(self.detector, "reset"):
@@ -172,3 +203,6 @@ class Pipeline:
 
     def totals(self) -> Dict[str, Dict[str, int]]:
         return self.counter.totals()
+
+    def zones(self) -> Dict[str, Dict[str, object]]:
+        return self.zone_counter.totals()

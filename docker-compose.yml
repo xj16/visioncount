@@ -1,0 +1,41 @@
+# One-command run for the VisionCount dashboard.
+#
+#   docker compose up            # dashboard on http://127.0.0.1:5000 (synthetic feed)
+#   docker compose --profile demo up   # same, but with SQLite event logging enabled
+#
+# To point at a real source, set VISIONCOUNT_SOURCE (a webcam index or a mounted
+# file path) in the environment or a .env file.
+
+services:
+  visioncount:
+    build: .
+    image: visioncount:latest
+    ports:
+      - "5000:5000"
+    environment:
+      VISIONCOUNT_SOURCE: "${VISIONCOUNT_SOURCE:-synthetic}"
+      VISIONCOUNT_AUTOSTART: "1"
+      # Uncomment to require an API key on the mutating endpoints:
+      # VISIONCOUNT_API_KEY: "change-me"
+      # Lock CORS to a specific origin if embedding cross-site:
+      # VISIONCOUNT_CORS_ORIGIN: "https://example.com"
+    restart: unless-stopped
+
+  # `--profile demo` brings the app up already logging every crossing to a
+  # persisted SQLite database, so /export.csv and /api/events return real data.
+  visioncount-demo:
+    build: .
+    image: visioncount:latest
+    profiles: ["demo"]
+    ports:
+      - "5000:5000"
+    environment:
+      VISIONCOUNT_SOURCE: "synthetic"
+      VISIONCOUNT_AUTOSTART: "1"
+      VISIONCOUNT_DB: "/data/visioncount.sqlite"
+    volumes:
+      - visioncount_data:/data
+    restart: unless-stopped
+
+volumes:
+  visioncount_data:

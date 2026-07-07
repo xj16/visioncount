@@ -1,16 +1,31 @@
 """Flask dashboard for VisionCount.
 
-Runs the pipeline in a background thread and serves:
+Runs the pipeline in a background thread and serves a live dashboard plus a small
+JSON/CSV analytics API:
 
-* ``/``                  - an HTML dashboard (live video, counts, heatmap)
+* ``/``                  - HTML dashboard (live video, counts, zones, heatmap,
+                           interactive line/zone drawing)
 * ``/video_feed``        - MJPEG stream of annotated frames
 * ``/heatmap.png``       - current motion heatmap as a PNG
-* ``/api/counts``        - JSON of current line counts + a rolling time series
-* ``/api/health``        - liveness probe
+* ``/api/counts``        - line counts + rolling time series + zone occupancy
+* ``/api/events``        - recent individual crossings (JSON)
+* ``/export.csv``        - streamed CSV of every crossing recorded this run
+* ``/api/lines``         - GET current lines; POST add; DELETE remove (live)
+* ``/api/zones``         - GET current zones; POST add a polygon zone (live)
+* ``/api/health``        - liveness/health probe (reports degraded/stale states)
 
 The video source defaults to the built-in synthetic clip so the dashboard works
 with zero configuration (great for demos and CI). Point it at a webcam or video
-file with the ``VISIONCOUNT_SOURCE`` environment variable.
+file with ``VISIONCOUNT_SOURCE``.
+
+Security (all opt-in, sensible defaults):
+    * A tiny in-process token-bucket rate limiter guards the mutating and
+      export endpoints (``VISIONCOUNT_RATE_LIMIT`` req/min, default 120).
+    * An optional API key (``VISIONCOUNT_API_KEY``) is required on mutating
+      endpoints when set (via ``X-API-Key`` or ``?api_key=``).
+    * CORS is locked down: no ``Access-Control-Allow-Origin`` unless you set
+      ``VISIONCOUNT_CORS_ORIGIN`` explicitly.
+    * All geometry input is validated and clamped to the frame.
 
 Run::
 
@@ -29,17 +44,36 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from flask import Flask, Response, jsonify, render_template_string
+from flask import (
+    Flask,
+    Response,
+    abort,
+    jsonify,
+    render_template_string,
+    request,
+)
 
 from .counter import CountingLine
+from .events import EventStore
 from .pipeline import Pipeline, PipelineConfig
 from .synthetic import frames as synthetic_frames
+from .templates import INDEX_HTML
+from .zone import Zone
+
+# Seconds without a fresh frame before the feed is considered "stale".
+STALE_AFTER = 5.0
+# Hard ceilings so a malicious/buggy client can't allocate unbounded geometry.
+MAX_LINES = 32
+MAX_ZONES = 16
+MAX_POLYGON_POINTS = 32
 
 
 class VideoProcessor:
     """Background thread that keeps a fresh annotated frame + counts ready.
 
-    Thread-safe: the latest encoded JPEG and the totals are guarded by a lock.
+    Thread-safe: the latest encoded JPEG, totals, series and error state are all
+    guarded by a single lock. Exceptions inside the worker are captured into
+    ``last_error`` and surfaced on ``/api/health`` instead of dying silently.
     """
 
     def __init__(
@@ -48,13 +82,21 @@ class VideoProcessor:
         width: int = 640,
         height: int = 480,
         lines: Optional[List[CountingLine]] = None,
+        zones: Optional[List[Zone]] = None,
         loop: bool = True,
+        store: Optional[EventStore] = None,
     ) -> None:
         self.source = source
         self.width = width
         self.height = height
         self.lines = lines
+        self.zones = zones
         self.loop = loop
+        self.store = store or EventStore(
+            maxlen=int(os.environ.get("VISIONCOUNT_EVENT_BUFFER", "500")),
+            db_path=os.environ.get("VISIONCOUNT_DB") or None,
+            webhook_url=os.environ.get("VISIONCOUNT_WEBHOOK") or None,
+        )
 
         self._lock = threading.Lock()
         self._latest_jpeg: Optional[bytes] = None
@@ -65,6 +107,9 @@ class VideoProcessor:
         # Rolling time series of total crossings for the dashboard chart.
         self._series: Deque[Tuple[float, int]] = deque(maxlen=120)
         self._fps = 0.0
+        self.last_error: Optional[str] = None
+        self._last_frame_at = 0.0
+        self._frames_seen = 0
 
     # ---- source frames ---------------------------------------------------
 
@@ -110,6 +155,17 @@ class VideoProcessor:
             self._thread.join(timeout=2.0)
 
     def _run(self) -> None:
+        # Wrap the whole worker so a bad source (unreadable file, missing webcam)
+        # is captured and surfaced via /api/health rather than dying silently in
+        # a daemon thread and leaving a frozen blank feed.
+        try:
+            self._run_inner()
+        except Exception as exc:  # noqa: BLE001 - deliberately broad
+            with self._lock:
+                self.last_error = f"{type(exc).__name__}: {exc}"
+            self._running = False
+
+    def _run_inner(self) -> None:
         frame_iter = self._open_frames()
         first = next(frame_iter)
         h, w = first.shape[:2]
@@ -117,12 +173,16 @@ class VideoProcessor:
             w,
             h,
             lines=self.lines,
+            zones=self.zones,
             config=PipelineConfig(min_area=350),
         )
 
         def process_and_store(frame: np.ndarray) -> None:
             assert self.pipeline is not None
             result = self.pipeline.process(frame)
+            # Persist each crossing (ring + optional SQLite + optional webhook).
+            if result.events:
+                self.store.record_many(result.events)
             annotated = self.pipeline.annotate(frame, result)
             annotated = self.pipeline.heatmap.overlay(annotated, alpha=0.4)
             ok, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
@@ -135,6 +195,9 @@ class VideoProcessor:
                 if ok_h:
                     self._latest_heatmap_png = buf_h.tobytes()
                 self._series.append((time.time(), total))
+                self._last_frame_at = time.time()
+                self._frames_seen += 1
+                self.last_error = None
 
         last = time.time()
         process_and_store(first)
@@ -150,6 +213,51 @@ class VideoProcessor:
             # Pace to a sensible rate so a synthetic feed does not peg a core.
             time.sleep(0.03)
 
+    # ---- live line/zone mutation ----------------------------------------
+
+    def add_line(self, name: str, start, end) -> None:
+        """Add a counting line to the *running* pipeline (thread-safe)."""
+        with self._lock:
+            if self.pipeline is None:
+                # Not started yet: stash so it is created with the pipeline.
+                self.lines = list(self.lines or [])
+                self.lines.append(CountingLine(name=name, start=start, end=end))
+            else:
+                self.pipeline.counter.add_line(
+                    CountingLine(name=name, start=start, end=end)
+                )
+
+    def remove_line(self, name: str) -> bool:
+        with self._lock:
+            if self.pipeline is None:
+                before = len(self.lines or [])
+                self.lines = [ln for ln in (self.lines or []) if ln.name != name]
+                return len(self.lines) < before
+            counter = self.pipeline.counter
+            before = len(counter.lines)
+            counter.lines = [ln for ln in counter.lines if ln.name != name]
+            return len(counter.lines) < before
+
+    def line_count(self) -> int:
+        with self._lock:
+            if self.pipeline is not None:
+                return len(self.pipeline.counter.lines)
+            return len(self.lines or [])
+
+    def add_zone(self, name: str, polygon) -> None:
+        with self._lock:
+            if self.pipeline is None:
+                self.zones = list(self.zones or [])
+                self.zones.append(Zone(name=name, polygon=polygon))
+            else:
+                self.pipeline.zone_counter.add_zone(Zone(name=name, polygon=polygon))
+
+    def zone_count(self) -> int:
+        with self._lock:
+            if self.pipeline is not None:
+                return len(self.pipeline.zone_counter.zones)
+            return len(self.zones or [])
+
     # ---- accessors -------------------------------------------------------
 
     def get_jpeg(self) -> Optional[bytes]:
@@ -161,125 +269,93 @@ class VideoProcessor:
             return self._latest_heatmap_png
 
     def get_counts(self) -> Dict:
-        totals = self.pipeline.totals() if self.pipeline else {}
         with self._lock:
-            series = [
-                {"t": round(t, 2), "total": v} for t, v in self._series
-            ]
+            totals = self.pipeline.totals() if self.pipeline else {}
+            zones = self.pipeline.zones() if self.pipeline else {}
+            series = [{"t": round(t, 2), "total": v} for t, v in self._series]
+            fps = round(self._fps, 1)
         return {
             "lines": totals,
+            "zones": zones,
             "grand_total": sum(c["total"] for c in totals.values()),
             "series": series,
-            "fps": round(self._fps, 1),
+            "fps": fps,
+        }
+
+    def health(self) -> Dict:
+        now = time.time()
+        with self._lock:
+            error = self.last_error
+            last_frame_at = self._last_frame_at
+            frames_seen = self._frames_seen
+            running = self._running
+        stale = running and last_frame_at > 0 and (now - last_frame_at) > STALE_AFTER
+        if error is not None:
+            status = "degraded"
+        elif stale:
+            status = "stale"
+        elif frames_seen == 0:
+            status = "starting" if running else "ok"
+        else:
+            status = "ok"
+        return {
+            "status": status,
+            "source": self.source,
+            "error": error,
+            "frames_seen": frames_seen,
+            "seconds_since_frame": (
+                round(now - last_frame_at, 2) if last_frame_at else None
+            ),
+            "events_recorded": self.store.count(),
         }
 
 
-_INDEX_HTML = """
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>VisionCount Dashboard</title>
-<style>
-  :root { --bg:#0f2f4a; --bg2:#163a52; --accent:#1f7a8c; --card:#ffffff; --ink:#12232e; --muted:#5b7280; }
-  * { box-sizing: border-box; }
-  body { margin:0; font-family: "Segoe UI", system-ui, sans-serif; color:var(--ink); background:#eef3f6; }
-  header { background:linear-gradient(120deg,var(--bg),var(--bg2)); color:#fff; padding:20px 28px; }
-  header h1 { margin:0; font-size:22px; letter-spacing:.3px; }
-  header p { margin:4px 0 0; opacity:.8; font-size:13px; }
-  .wrap { max-width:1100px; margin:22px auto; padding:0 18px; display:grid; grid-template-columns:2fr 1fr; gap:18px; }
-  @media (max-width:820px){ .wrap{ grid-template-columns:1fr; } }
-  .card { background:var(--card); border-radius:12px; box-shadow:0 2px 10px rgba(15,47,74,.08); padding:16px; }
-  .card h2 { margin:0 0 12px; font-size:14px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted); }
-  img.feed { width:100%; border-radius:8px; display:block; background:#000; }
-  .stat { display:flex; align-items:baseline; gap:10px; margin-bottom:10px; }
-  .stat .num { font-size:34px; font-weight:700; color:var(--accent); }
-  .stat .lbl { color:var(--muted); font-size:13px; }
-  table { width:100%; border-collapse:collapse; font-size:14px; }
-  th,td { text-align:left; padding:7px 6px; border-bottom:1px solid #eef1f3; }
-  th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; }
-  .pill { display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; background:#e6f2f4; color:var(--accent); }
-  canvas { width:100%; height:120px; }
-  footer { text-align:center; color:var(--muted); font-size:12px; padding:18px; }
-  code { background:#eef1f3; padding:1px 6px; border-radius:5px; }
-</style>
-</head>
-<body>
-<header>
-  <h1>VisionCount</h1>
-  <p>Real-time object counting &amp; line-crossing analytics &middot; source: <code>{{ feed_source }}</code></p>
-</header>
-<div class="wrap">
-  <div class="card">
-    <h2>Live feed</h2>
-    <img class="feed" src="/video_feed" alt="live annotated feed"/>
-  </div>
-  <div>
-    <div class="card" style="margin-bottom:18px;">
-      <h2>Totals</h2>
-      <div class="stat"><span class="num" id="grand">0</span><span class="lbl">total crossings</span></div>
-      <div class="stat"><span class="num" id="fps" style="font-size:20px;">0</span><span class="lbl">fps</span></div>
-      <table id="lines"><thead><tr><th>Line</th><th>In</th><th>Out</th><th>Net</th></tr></thead><tbody></tbody></table>
-    </div>
-    <div class="card" style="margin-bottom:18px;">
-      <h2>Crossings over time</h2>
-      <canvas id="chart" width="320" height="120"></canvas>
-    </div>
-    <div class="card">
-      <h2>Heatmap</h2>
-      <img class="feed" id="heat" src="/heatmap.png" alt="motion heatmap"/>
-    </div>
-  </div>
-</div>
-<footer>VisionCount &middot; OpenCV background-subtraction pipeline &middot; MIT licensed</footer>
-<script>
-function drawChart(series){
-  const c = document.getElementById('chart'); const ctx = c.getContext('2d');
-  const W=c.width,H=c.height; ctx.clearRect(0,0,W,H);
-  if(!series.length) return;
-  const vals = series.map(p=>p.total);
-  const max = Math.max(1, ...vals);
-  ctx.strokeStyle='#1f7a8c'; ctx.lineWidth=2; ctx.beginPath();
-  series.forEach((p,i)=>{
-    const x=(i/(series.length-1||1))*W;
-    const y=H-(p.total/max)*(H-8)-4;
-    i?ctx.lineTo(x,y):ctx.moveTo(x,y);
-  });
-  ctx.stroke();
-}
-async function tick(){
-  try{
-    const r = await fetch('/api/counts'); const d = await r.json();
-    document.getElementById('grand').textContent = d.grand_total;
-    document.getElementById('fps').textContent = d.fps;
-    const tb = document.querySelector('#lines tbody'); tb.innerHTML='';
-    for(const [name,c] of Object.entries(d.lines)){
-      const tr=document.createElement('tr');
-      tr.innerHTML=`<td><span class="pill">${name}</span></td><td>${c.in}</td><td>${c.out}</td><td>${c.net}</td>`;
-      tb.appendChild(tr);
-    }
-    drawChart(d.series);
-  }catch(e){ /* ignore transient errors */ }
-}
-setInterval(tick, 1000); tick();
-// refresh heatmap periodically
-setInterval(()=>{ document.getElementById('heat').src='/heatmap.png?'+Date.now(); }, 2000);
-</script>
-</body>
-</html>
-"""
+# ---- security helpers ----------------------------------------------------
+
+
+class RateLimiter:
+    """Minimal fixed-window per-client rate limiter (thread-safe).
+
+    Not a distributed limiter -- just enough to stop a single client from
+    hammering the mutating/export endpoints of a self-hosted instance.
+    """
+
+    def __init__(self, per_minute: int) -> None:
+        self.per_minute = max(1, per_minute)
+        self._lock = threading.Lock()
+        self._hits: Dict[str, Deque[float]] = {}
+
+    def allow(self, key: str) -> bool:
+        now = time.time()
+        window = 60.0
+        with self._lock:
+            q = self._hits.setdefault(key, deque())
+            while q and now - q[0] > window:
+                q.popleft()
+            if len(q) >= self.per_minute:
+                return False
+            q.append(now)
+            return True
+
+
+def _clamp(v: float, lo: float, hi: float) -> int:
+    return int(max(lo, min(hi, v)))
 
 
 def create_app(processor: Optional[VideoProcessor] = None) -> Flask:
     """Application factory. If no processor is given, one is created + started."""
     app = Flask(__name__)
     source = os.environ.get("VISIONCOUNT_SOURCE", "synthetic")
+    api_key = os.environ.get("VISIONCOUNT_API_KEY") or None
+    cors_origin = os.environ.get("VISIONCOUNT_CORS_ORIGIN") or None
+    limiter = RateLimiter(int(os.environ.get("VISIONCOUNT_RATE_LIMIT", "120")))
 
     if processor is None:
         processor = VideoProcessor(source=source)
 
     app.config["PROCESSOR"] = processor
+    # Cap request bodies (line/zone JSON is tiny); rejects oversized payloads.
+    app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
 
     # Worker lifecycle. Importing the module must never spin up an OpenCV
     # background thread (keeps tests / CI / `flask --app` cheap and avoids a
@@ -299,12 +375,44 @@ def create_app(processor: Optional[VideoProcessor] = None) -> Flask:
         def _ensure_started():  # pragma: no cover - trivial guard
             processor.start()  # idempotent; no-op once running
 
+    # ---- security wiring -------------------------------------------------
+
+    @app.after_request
+    def _cors(resp: Response) -> Response:
+        # Locked down by default: only emit CORS headers when explicitly opted in.
+        if cors_origin:
+            resp.headers["Access-Control-Allow-Origin"] = cors_origin
+            resp.headers["Vary"] = "Origin"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+        return resp
+
+    def _require_key() -> None:
+        if api_key is None:
+            return
+        supplied = request.headers.get("X-API-Key") or request.args.get("api_key")
+        if supplied != api_key:
+            abort(401, description="invalid or missing API key")
+
+    def _rate_limit() -> None:
+        client = request.remote_addr or "anon"
+        if not limiter.allow(client):
+            abort(429, description="rate limit exceeded")
+
+    # ---- pages / streams -------------------------------------------------
+
     @app.route("/")
     def index():
-        return render_template_string(_INDEX_HTML, feed_source=processor.source)
+        return render_template_string(INDEX_HTML, feed_source=processor.source)
 
     @app.route("/video_feed")
     def video_feed():
+        # If the worker has permanently failed, do not hang a client on a stream
+        # that will never produce a frame: return a clear 503 instead.
+        h = processor.health()
+        if h["status"] == "degraded" and h["frames_seen"] == 0:
+            abort(503, description=h["error"] or "video worker unavailable")
+
         def gen():
             boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
             while True:
@@ -327,15 +435,155 @@ def create_app(processor: Optional[VideoProcessor] = None) -> Flask:
             png = buf.tobytes()
         return Response(png, mimetype="image/png")
 
+    # ---- analytics API ---------------------------------------------------
+
     @app.route("/api/counts")
     def api_counts():
         return jsonify(processor.get_counts())
 
+    @app.route("/api/events")
+    def api_events():
+        try:
+            limit = int(request.args.get("limit", "100"))
+        except ValueError:
+            abort(400, description="limit must be an integer")
+        limit = max(1, min(limit, 1000))
+        return jsonify({"events": processor.store.recent(limit)})
+
+    @app.route("/export.csv")
+    def export_csv():
+        _rate_limit()
+        return Response(
+            processor.store.iter_csv(),
+            mimetype="text/csv",
+            headers={
+                "Content-Disposition": "attachment; filename=visioncount_crossings.csv"
+            },
+        )
+
     @app.route("/api/health")
     def api_health():
-        return jsonify({"status": "ok", "source": processor.source})
+        return jsonify(processor.health())
+
+    # ---- live line/zone editing -----------------------------------------
+
+    @app.route("/api/lines", methods=["GET", "POST", "DELETE", "OPTIONS"])
+    def api_lines():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        if request.method == "GET":
+            counts = processor.get_counts()
+            lines = []
+            pipe = processor.pipeline
+            if pipe is not None:
+                for ln in pipe.counter.lines:
+                    lines.append(
+                        {
+                            "name": ln.name,
+                            "start": [int(ln.start[0]), int(ln.start[1])],
+                            "end": [int(ln.end[0]), int(ln.end[1])],
+                            **counts["lines"].get(ln.name, {}),
+                        }
+                    )
+            return jsonify({"lines": lines})
+
+        _require_key()
+        _rate_limit()
+
+        if request.method == "DELETE":
+            name = (request.args.get("name") or "").strip()
+            if not name:
+                abort(400, description="name is required")
+            removed = processor.remove_line(name)
+            return jsonify({"removed": removed}), (200 if removed else 404)
+
+        # POST: add a line.
+        data = request.get_json(silent=True) or {}
+        name, start, end = _validate_line(data, processor)
+        if processor.line_count() >= MAX_LINES:
+            abort(400, description=f"too many lines (max {MAX_LINES})")
+        processor.add_line(name, start, end)
+        return jsonify({"ok": True, "name": name}), 201
+
+    @app.route("/api/zones", methods=["GET", "POST", "OPTIONS"])
+    def api_zones():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        if request.method == "GET":
+            return jsonify({"zones": processor.get_counts()["zones"]})
+
+        _require_key()
+        _rate_limit()
+        data = request.get_json(silent=True) or {}
+        name, polygon = _validate_zone(data, processor)
+        if processor.zone_count() >= MAX_ZONES:
+            abort(400, description=f"too many zones (max {MAX_ZONES})")
+        processor.add_zone(name, polygon)
+        return jsonify({"ok": True, "name": name}), 201
+
+    @app.errorhandler(400)
+    @app.errorhandler(401)
+    @app.errorhandler(404)
+    @app.errorhandler(429)
+    @app.errorhandler(503)
+    def _json_error(err):
+        return (
+            jsonify({"error": getattr(err, "description", str(err))}),
+            getattr(err, "code", 500),
+        )
 
     return app
+
+
+# ---- input validation ----------------------------------------------------
+
+
+def _validate_line(data: Dict, processor: VideoProcessor):
+    name = str(data.get("name", "")).strip()[:40]
+    if not name:
+        abort(400, description="name is required")
+    start = data.get("start")
+    end = data.get("end")
+    if not (_is_point(start) and _is_point(end)):
+        abort(400, description="start and end must be [x, y] points")
+    w, h = processor.width, processor.height
+    pipe = processor.pipeline
+    if pipe is not None:
+        w, h = pipe.width, pipe.height
+    s = (_clamp(start[0], 0, w), _clamp(start[1], 0, h))
+    e = (_clamp(end[0], 0, w), _clamp(end[1], 0, h))
+    if s == e:
+        abort(400, description="line start and end must differ")
+    return name, s, e
+
+
+def _validate_zone(data: Dict, processor: VideoProcessor):
+    name = str(data.get("name", "")).strip()[:40]
+    if not name:
+        abort(400, description="name is required")
+    polygon = data.get("polygon")
+    if not isinstance(polygon, list) or len(polygon) < 3:
+        abort(400, description="polygon must be a list of >= 3 [x, y] points")
+    if len(polygon) > MAX_POLYGON_POINTS:
+        abort(400, description=f"polygon has too many points (max {MAX_POLYGON_POINTS})")
+    w, h = processor.width, processor.height
+    pipe = processor.pipeline
+    if pipe is not None:
+        w, h = pipe.width, pipe.height
+    clamped = []
+    for pt in polygon:
+        if not _is_point(pt):
+            abort(400, description="polygon points must be [x, y]")
+        clamped.append((_clamp(pt[0], 0, w), _clamp(pt[1], 0, h)))
+    return name, clamped
+
+
+def _is_point(p) -> bool:
+    return (
+        isinstance(p, (list, tuple))
+        and len(p) == 2
+        and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in p)
+    )
 
 
 # Module-level app for `flask --app visioncount.app run`.

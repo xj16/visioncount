@@ -31,6 +31,17 @@ env/
 *.avi
 !tests/**/*.mp4
 
+# Coverage
+.coverage
+.coverage.*
+coverage.json
+coverage.xml
+htmlcov/
+
+# Local SQLite event logs
+*.sqlite
+*.sqlite3
+
 # OS / editor
 .DS_Store
 Thumbs.db

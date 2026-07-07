@@ -44,8 +44,34 @@ jobs:
       - name: Verify the Flask app imports
         run: python -c "import visioncount.app as a; assert hasattr(a, 'app'); print('flask app OK')"
 
-      - name: Run tests
-        run: pytest -q
+      - name: Run tests with coverage (gate at 80%)
+        run: pytest -q --cov=visioncount --cov-report=term-missing --cov-fail-under=80
+
+  demo-artifacts:
+    name: demo artifacts (frames + gif + report)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .
+      - name: Regenerate demo images + looping GIF
+        run: python examples/generate_demo.py --gif
+      - name: Upload demo artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: visioncount-demo
+          path: |
+            docs/demo_frame.png
+            docs/demo_heatmap.png
+            docs/demo_report.png
+            docs/demo.gif
 
   lint:
     name: lint (ruff)

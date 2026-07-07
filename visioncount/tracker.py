@@ -28,12 +28,22 @@ class Track:
     bbox: Tuple[int, int, int, int]
     missing: int = 0
     trajectory: Deque[Tuple[int, int]] = field(default_factory=lambda: deque(maxlen=32))
+    # Estimated constant-velocity (px/frame), updated on each match.
+    velocity: Tuple[float, float] = (0.0, 0.0)
 
     @property
     def prev_centroid(self) -> Tuple[int, int] | None:
         if len(self.trajectory) >= 2:
             return self.trajectory[-2]
         return None
+
+    def predicted_centroid(self) -> Tuple[float, float]:
+        """Where the object is expected next, from its constant velocity.
+
+        Matching against the *prediction* rather than the last seen position
+        keeps IDs stable when objects cross paths or briefly occlude.
+        """
+        return (self.centroid[0] + self.velocity[0], self.centroid[1] + self.velocity[1])
 
 
 class CentroidTracker:
@@ -49,13 +59,23 @@ class CentroidTracker:
         track. Prevents teleporting IDs across the frame.
     """
 
-    def __init__(self, max_disappeared: int = 20, max_distance: float = 80.0) -> None:
+    def __init__(
+        self,
+        max_disappeared: int = 20,
+        max_distance: float = 80.0,
+        vel_smooth: float = 0.5,
+    ) -> None:
         if max_disappeared < 0:
             raise ValueError("max_disappeared must be >= 0")
         if max_distance <= 0:
             raise ValueError("max_distance must be > 0")
+        if not (0.0 <= vel_smooth < 1.0):
+            raise ValueError("vel_smooth must be in [0, 1)")
         self.max_disappeared = max_disappeared
         self.max_distance = max_distance
+        # Smoothing factor for the velocity estimate: higher = steadier, slower
+        # to react. 0.5 balances responsiveness against jitter for CPU tracking.
+        self._vel_smooth = vel_smooth
         self._next_id = 0
         self.tracks: "OrderedDict[int, Track]" = OrderedDict()
 
@@ -89,8 +109,11 @@ class CentroidTracker:
             return dict(self.tracks)
 
         track_ids = list(self.tracks.keys())
+        # Match against each track's *predicted* next position, not its last one,
+        # so objects that keep moving during a brief miss stay associated.
         track_centroids = np.array(
-            [self.tracks[tid].centroid for tid in track_ids], dtype=np.float64
+            [self.tracks[tid].predicted_centroid() for tid in track_ids],
+            dtype=np.float64,
         )
 
         # Distance matrix: rows = tracks, cols = detections.
@@ -110,10 +133,18 @@ class CentroidTracker:
                 continue
             track = self.tracks[track_ids[row]]
             det = detections[col]
-            track.centroid = det.centroid
+            new_centroid = det.centroid
+            # Exponentially-smoothed velocity estimate (px/frame).
+            vx = new_centroid[0] - track.centroid[0]
+            vy = new_centroid[1] - track.centroid[1]
+            track.velocity = (
+                self._vel_smooth * track.velocity[0] + (1 - self._vel_smooth) * vx,
+                self._vel_smooth * track.velocity[1] + (1 - self._vel_smooth) * vy,
+            )
+            track.centroid = new_centroid
             track.bbox = det.as_bbox()
             track.missing = 0
-            track.trajectory.append(det.centroid)
+            track.trajectory.append(new_centroid)
             used_rows.add(row)
             used_cols.add(col)
 

@@ -27,8 +27,10 @@ import cv2
 import numpy as np
 
 from .counter import CountingLine
+from .events import EventStore
 from .pipeline import Pipeline, PipelineConfig
 from .synthetic import frames as synthetic_frames
+from .zone import Zone
 
 
 def _parse_line(spec: str) -> Tuple[str, Tuple[int, int], Tuple[int, int]]:
@@ -41,6 +43,23 @@ def _parse_line(spec: str) -> Tuple[str, Tuple[int, int], Tuple[int, int]]:
             f"invalid --line '{spec}', expected name:x1,y1,x2,y2"
         ) from exc
     return name, (x1, y1), (x2, y2)
+
+
+def _parse_zone(spec: str) -> Tuple[str, list]:
+    """Parse ``name:x1,y1;x2,y2;x3,y3`` into (name, [(x, y), ...])."""
+    try:
+        name, coords = spec.split(":", 1)
+        points = []
+        for pair in coords.split(";"):
+            x, y = (int(v) for v in pair.split(","))
+            points.append((x, y))
+        if len(points) < 3:
+            raise ValueError("need at least 3 points")
+    except Exception as exc:  # noqa: BLE001
+        raise argparse.ArgumentTypeError(
+            f"invalid --zone '{spec}', expected name:x1,y1;x2,y2;x3,y3..."
+        ) from exc
+    return name, points
 
 
 def _iter_source(
@@ -94,8 +113,20 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="name:x1,y1,x2,y2",
         help="Counting line(s). Repeatable. Defaults to a vertical center line.",
     )
+    p.add_argument(
+        "--zone",
+        action="append",
+        type=_parse_zone,
+        metavar="name:x1,y1;x2,y2;x3,y3...",
+        help="Polygon occupancy zone(s). Repeatable. >= 3 semicolon-separated points.",
+    )
     p.add_argument("--min-area", type=int, default=400)
     p.add_argument("--output", help="Optional path to write an annotated MP4.")
+    p.add_argument(
+        "--db",
+        metavar="PATH.sqlite",
+        help="Log every crossing to a SQLite database (event analytics store).",
+    )
     p.add_argument(
         "--report",
         metavar="PATH.png",
@@ -132,6 +163,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         for name, start, end in args.line:
             lines.append(CountingLine(name=name, start=start, end=end))
 
+    zones: List[Zone] = []
+    if args.zone:
+        for name, polygon in args.zone:
+            zones.append(Zone(name=name, polygon=polygon))
+
     detector = None
     if args.yolo:
         from .yolo_detector import YoloDetector  # lazy, may need torch
@@ -144,7 +180,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         lines=lines or None,
         detector=detector,
         config=PipelineConfig(min_area=args.min_area),
+        zones=zones or None,
     )
+
+    store = EventStore(db_path=args.db) if args.db else None
 
     writer = None
     if args.output:
@@ -155,6 +194,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     def handle(frame: np.ndarray) -> None:
         result = pipe.process(frame)
+        if store is not None and result.events:
+            store.record_many(result.events)
         for ev in result.events:
             print(f"[frame {result.frame_index}] {ev.line}: {ev.direction} #{ev.track_id}")
         grand = sum(c["total"] for c in result.totals.values())
@@ -188,12 +229,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         render_report(totals, series, args.report)
         print(f"Wrote report to {args.report}")
 
+    if store is not None:
+        print(f"Logged {store.count()} crossing(s) to {args.db}")
+        store.close()
+
+    zones_out = pipe.zones()
+
     if args.json:
-        print(json.dumps(totals, indent=2))
+        print(json.dumps({"lines": totals, "zones": zones_out}, indent=2))
     else:
         print("\nFinal counts:")
         for name, c in totals.items():
             print(f"  {name}: in={c['in']} out={c['out']} total={c['total']} net={c['net']}")
+        if zones_out:
+            print("Zones:")
+            for name, z in zones_out.items():
+                print(f"  {name}: now={z['occupancy']} peak={z['peak']} entries={z['entries']}")
     return 0
 
 

@@ -47,7 +47,7 @@ def test_counts_endpoint_shape(client):
     resp = client.get("/api/counts")
     assert resp.status_code == 200
     data = resp.get_json()
-    assert set(data.keys()) == {"lines", "grand_total", "series", "fps"}
+    assert set(data.keys()) == {"lines", "zones", "grand_total", "series", "fps"}
 
 
 def test_heatmap_endpoint_returns_png(client):
